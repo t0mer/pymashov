@@ -524,3 +524,20 @@ This is an unofficial API wrapper and is not affiliated with, endorsed by, or co
 - Mail conversations support
 - Public schools endpoint
 - Async/await support with httpx
+## Hardened transport and diagnostics
+
+The client accepts only https://web.mashov.info and relative API paths under
+/api/. Absolute URLs, alternate origins, redirects and per-request redirect
+or authentication overrides are rejected. HTTPX selects cookies for the
+destination and path.
+
+Environment proxy and certificate overrides are disabled with trust_env=False.
+TLS certificate verification stays enabled. Applications using enterprise
+proxy or CA environment settings must account for this compatibility change.
+
+Wrapper exceptions contain generic transport failures or HTTP status codes.
+Session representations hide authentication and CSRF tokens. Wrapper logs
+omit usernames, student identifiers, request paths and response bodies.
+HTTPX and HTTPCore have separate loggers. Applications should set httpx and
+httpcore logging to WARNING or above when URLs contain student identifiers.
+The package does not change application-wide logging settings.
