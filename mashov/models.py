@@ -1,15 +1,12 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-import httpx
 
 
 @dataclass(frozen=True)
 class MashovSession:
-    csrf_header_token: str        # from response header x-csrf-token
-    cookie_header: str            # "a=b; c=d"
+    csrf_header_token: str = field(repr=False)
+    cookie_header: str = field(repr=False)
     base_url: str
     year: str
-
-    # optional: keep for debugging
-    mashov_auth_token: Optional[str] = None
-    csrf_cookie_token: Optional[str] = None
+    mashov_auth_token: Optional[str] = field(default=None, repr=False)
+    csrf_cookie_token: Optional[str] = field(default=None, repr=False)

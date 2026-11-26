@@ -11,10 +11,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://web.mashov.info"
 
-
 def _build_cookie_header(jar: httpx.Cookies) -> str:
     return "; ".join(f"{k}={v}" for k, v in jar.items())
-
 
 class MashovClient:
     def __init__(
@@ -28,37 +26,34 @@ class MashovClient:
         timeout: float = 20.0,
         auto_login: bool = True,
     ):
-        logger.info(f"Initializing MashovClient for user: {username}, semel: {semel}, year: {year}")
+
         self._username = username
         self._password = password
         self._semel = semel
         self._year = str(year)
-        self._base_url = base_url.rstrip("/")
+        origin = httpx.URL(base_url)
+        if (origin.scheme != "https" or origin.host != "web.mashov.info"
+                or origin.port not in (None, 443) or origin.userinfo
+                or origin.path != "/" or origin.query or origin.fragment):
+            raise ValueError("Expected the Mashov HTTPS origin.")
+        self._base_url = DEFAULT_BASE_URL
         self._auto_login = auto_login
 
-        try:
-            self._http = httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=timeout,
-                headers={"Content-Type": "application/json"},
-                follow_redirects=True,
-            )
-            logger.debug(f"HTTP client created with timeout={timeout}s")
-        except Exception as e:
-            logger.error(f"Failed to create HTTP client: {e}")
-            raise
+        self._http = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=timeout,
+            headers={"Content-Type": "application/json"},
+            follow_redirects=False,
+            trust_env=False,
+        )
 
         self._session: Optional[MashovSession] = None
 
     async def close(self) -> None:
         """Close the HTTP client connection."""
-        try:
-            logger.debug("Closing HTTP client connection")
-            await self._http.aclose()
-            logger.info("HTTP client connection closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing HTTP client: {e}")
-            raise
+        logger.debug("Closing HTTP client connection")
+        await self._http.aclose()
+        logger.info("HTTP client connection closed successfully")
 
     async def __aenter__(self) -> "MashovClient":
         # don't force login — let user choose
@@ -81,8 +76,7 @@ class MashovClient:
         """
         Login ONLY. Does not call any other endpoint.
         """
-        logger.info(f"Attempting to login as user: {self._username} (semel: {self._semel}, year: {self._year})")
-        
+
         try:
             resp = await self._http.post(
                 "/api/login",
@@ -93,17 +87,17 @@ class MashovClient:
                     "year": self._year,
                 },
             )
-            logger.debug(f"Login request completed with status code: {resp.status_code}")
-        except httpx.TimeoutException as e:
-            logger.error(f"Login request timed out: {e}")
-            raise MashovLoginError(f"Login request timed out: {e}") from e
-        except httpx.RequestError as e:
-            logger.error(f"Login request failed: {e}")
-            raise MashovLoginError(f"Login request failed: {e}") from e
 
-        if resp.status_code >= 400:
-            logger.error(f"Login failed with status {resp.status_code}: {resp.text}")
-            raise MashovLoginError(f"Login failed ({resp.status_code}): {resp.text}")
+        except httpx.TimeoutException:
+
+            raise MashovLoginError("Login request timed out") from None
+        except httpx.RequestError:
+
+            raise MashovLoginError("Login request failed") from None
+
+        if not resp.is_success:
+
+            raise MashovLoginError(f"Login failed ({resp.status_code})")
 
         csrf_header_token = resp.headers.get("x-csrf-token")
         if not csrf_header_token:
@@ -123,8 +117,7 @@ class MashovClient:
             mashov_auth_token=self._http.cookies.get("MashovAuthToken"),
             csrf_cookie_token=self._http.cookies.get("Csrf-Token"),
         )
-        logger.info(f"Login successful for user: {self._username}")
-        logger.debug(f"Session established with CSRF token and cookies")
+
         return self._session
 
     async def ensure_logged_in(self) -> None:
@@ -141,6 +134,16 @@ class MashovClient:
         logger.info("Auto-login triggered")
         await self.login()
 
+    @staticmethod
+    def _validate_request(path: str, options: dict) -> None:
+        url = httpx.URL(path)
+        if (not path.startswith("/api/") or url.scheme or url.host
+                or "\\" in path or any(ord(char) < 32 for char in path)
+                or not httpx.URL(DEFAULT_BASE_URL).join(path).path.startswith("/api/")):
+            raise MashovRequestError("Expected a relative Mashov API path.")
+        if "follow_redirects" in options or "auth" in options:
+            raise MashovRequestError("Request cannot override transport authentication or redirect policy.")
+
     async def request(
         self,
         method: str,
@@ -152,12 +155,12 @@ class MashovClient:
         """
         Low-level request method so ANY API endpoint can be called separately.
         """
-        logger.debug(f"Making {method} request to {path}")
-        
+
+        self._validate_request(path, kwargs)
         try:
             await self.ensure_logged_in()
         except MashovLoginError as e:
-            logger.error(f"Failed to ensure login before request: {e}")
+
             raise
             
         assert self._session is not None
@@ -168,22 +171,21 @@ class MashovClient:
 
         final_headers["X-Csrf-Token"] = self._session.csrf_header_token
 
-        # Optional: you can rely on the cookie jar, but you asked to attach it explicitly.
-        final_headers["Cookie"] = self._session.cookie_header
+        # HTTPX selects cookies for the destination and path.
 
         try:
             resp = await self._http.request(method, path, headers=final_headers, **kwargs)
-            logger.debug(f"{method} {path} completed with status {resp.status_code}")
-        except httpx.TimeoutException as e:
-            logger.error(f"{method} {path} timed out: {e}")
-            raise MashovRequestError(f"{method} {path} timed out: {e}") from e
-        except httpx.RequestError as e:
-            logger.error(f"{method} {path} request error: {e}")
-            raise MashovRequestError(f"{method} {path} request error: {e}") from e
 
-        if resp.status_code >= 400:
-            logger.error(f"{method} {path} failed with status {resp.status_code}: {resp.text}")
-            raise MashovRequestError(f"{method} {path} failed ({resp.status_code}): {resp.text}")
+        except httpx.TimeoutException:
+
+            raise MashovRequestError("Mashov request timed out") from None
+        except httpx.RequestError:
+
+            raise MashovRequestError("Mashov request failed") from None
+
+        if not resp.is_success:
+
+            raise MashovRequestError(f"Mashov request failed ({resp.status_code})")
 
         return resp
 
@@ -198,8 +200,8 @@ class MashovClient:
         """
         Make a request that does NOT require authentication.
         """
-        logger.debug(f"Making public {method} request to {path}")
-        
+        self._validate_request(path, kwargs)
+
         final_headers: Dict[str, str] = {}
         if headers:
             final_headers.update(headers)
@@ -211,18 +213,18 @@ class MashovClient:
                 headers=final_headers,
                 **kwargs,
             )
-            logger.debug(f"Public {method} {path} completed with status {resp.status_code}")
-        except httpx.TimeoutException as e:
-            logger.error(f"Public {method} {path} timed out: {e}")
-            raise MashovRequestError(f"{method} {path} timed out: {e}") from e
-        except httpx.RequestError as e:
-            logger.error(f"Public {method} {path} request error: {e}")
-            raise MashovRequestError(f"{method} {path} request error: {e}") from e
 
-        if resp.status_code >= 400:
-            logger.error(f"Public {method} {path} failed with status {resp.status_code}: {resp.text}")
+        except httpx.TimeoutException:
+
+            raise MashovRequestError("Mashov request timed out") from None
+        except httpx.RequestError:
+
+            raise MashovRequestError("Mashov request failed") from None
+
+        if not resp.is_success:
+
             raise MashovRequestError(
-                f"{method} {path} failed ({resp.status_code}): {resp.text}"
+                f"Mashov request failed ({resp.status_code})"
             )
 
         return resp
@@ -230,27 +232,19 @@ class MashovClient:
     # ---- Example endpoint wrapper ----
     async def get_grades(self, student_id: str) -> Any:
         """Get grades for a specific student."""
-        logger.info(f"Fetching grades for student: {student_id}")
-        try:
-            resp = await self.request("GET", f"/api/students/{student_id}/grades")
-            data = resp.json()
-            logger.info(f"Grades fetched successfully for student: {student_id}")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get grades for student {student_id}: {e}")
-            raise
+
+        resp = await self.request("GET", f"/api/students/{student_id}/grades")
+        data = resp.json()
+
+        return data
 
     async def get_schools(self) -> Any:
         """Get list of available schools (public endpoint)."""
         logger.info("Fetching schools list")
-        try:
-            resp = await self.public_request("GET", "/api/schools")
-            data = resp.json()
-            logger.info("Schools list fetched successfully")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get schools list: {e}")
-            raise
+        resp = await self.public_request("GET", "/api/schools")
+        data = resp.json()
+        logger.info("Schools list fetched successfully")
+        return data
 
     async def get_conversations(
         self,
@@ -259,22 +253,18 @@ class MashovClient:
         take: int = 20,
     ) -> Any:
         """Get mail inbox conversations."""
-        logger.info(f"Fetching conversations (skip={skip}, take={take})")
-        try:
-            resp = await self.request(
-                "GET",
-                "/api/mail/inbox/conversations",
-                params={
-                    "skip": skip,
-                    "take": take,
-                },
-            )
-            data = resp.json()
-            logger.info(f"Conversations fetched successfully (skip={skip}, take={take})")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get conversations: {e}")
-            raise
+
+        resp = await self.request(
+            "GET",
+            "/api/mail/inbox/conversations",
+            params={
+                "skip": skip,
+                "take": take,
+            },
+        )
+        data = resp.json()
+
+        return data
     
     async def get_timetable(self, student_id: str) -> Any:
         """
@@ -284,18 +274,13 @@ class MashovClient:
         - X-Csrf-Token
         - Cookies
         """
-        logger.info(f"Fetching timetable for student: {student_id}")
+
         path = f"/api/students/{student_id}/timetable"
 
-        try:
-            resp = await self.request("GET", path)
-            data = resp.json()
-            logger.info(f"Timetable fetched successfully for student: {student_id}")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get timetable for student {student_id}: {e}")
-            raise
-    
+        resp = await self.request("GET", path)
+        data = resp.json()
+
+        return data
 
     async def get_homework(self, student_id: str) -> Any:
         """
@@ -305,19 +290,14 @@ class MashovClient:
         - X-Csrf-Token
         - Cookies
         """
-        logger.info(f"Fetching homework for student: {student_id}")
+
         path = f"/api/students/{student_id}/homework"
 
-        try:
-            resp = await self.request("GET", path)
-            data = resp.json()
-            logger.info(f"Homework fetched successfully for student: {student_id}")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get homework for student {student_id}: {e}")
-            raise
-    
-    
+        resp = await self.request("GET", path)
+        data = resp.json()
+
+        return data
+
     async def get_behavior(self, student_id: str) -> Any:
         """
         Get behavior/discipline records for a specific student.
@@ -326,14 +306,10 @@ class MashovClient:
         - X-Csrf-Token
         - Cookies
         """
-        logger.info(f"Fetching behavior records for student: {student_id}")
+
         path = f"/api/students/{student_id}/behave"
 
-        try:
-            resp = await self.request("GET", path)
-            data = resp.json()
-            logger.info(f"Behavior records fetched successfully for student: {student_id}")
-            return data
-        except Exception as e:
-            logger.error(f"Failed to get behavior for student {student_id}: {e}")
-            raise
+        resp = await self.request("GET", path)
+        data = resp.json()
+
+        return data
