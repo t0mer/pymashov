@@ -5,7 +5,8 @@ from typing import Any, Optional, Dict
 import httpx
 
 from .exceptions import MashovLoginError, MashovRequestError
-from .models import MashovSession
+from .models import MashovSession, MashovChild
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class MashovClient:
             raise
 
         self._session: Optional[MashovSession] = None
+        self._children: tuple[MashovChild, ...] = ()
 
     async def close(self) -> None:
         """Close the HTTP client connection."""
@@ -115,6 +117,23 @@ class MashovClient:
             logger.error("Login did not set cookies (cookie jar is empty)")
             raise MashovLoginError("Login did not set cookies (cookie jar is empty)")
 
+        try:
+            payload = resp.json()
+            children = payload.get("accessToken", {}).get("children", [])
+            if not isinstance(children, list):
+                raise ValueError
+            parsed_children = []
+            for child in children:
+                guid = str(UUID(child["childGuid"]))
+                name = child["privateName"]
+                family = child.get("familyName", "")
+                if not isinstance(name, str) or not isinstance(family, str):
+                    raise ValueError
+                parsed_children.append(MashovChild(guid, name, family))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise MashovLoginError("Invalid children in login response") from None
+
+        self._children = tuple(parsed_children)
         self._session = MashovSession(
             csrf_header_token=csrf_header_token,
             cookie_header=cookie_header,
@@ -126,6 +145,11 @@ class MashovClient:
         logger.info(f"Login successful for user: {self._username}")
         logger.debug(f"Session established with CSRF token and cookies")
         return self._session
+
+    async def get_children(self) -> tuple[MashovChild, ...]:
+        """Return accessible children with internal GUIDs for student endpoints."""
+        await self.ensure_logged_in()
+        return self._children
 
     async def ensure_logged_in(self) -> None:
         """

@@ -524,3 +524,22 @@ This is an unofficial API wrapper and is not affiliated with, endorsed by, or co
 - Mail conversations support
 - Public schools endpoint
 - Async/await support with httpx
+## Parent accounts and student GUIDs
+
+After login, get_children() exposes accessToken.children as immutable
+MashovChild objects with child_guid, private_name and family_name.
+
+```python
+async with MashovClient(username, password, semel, year=year) as client:
+    for child in await client.get_children():
+        homework = await client.get_homework(child.child_guid)
+```
+
+Student endpoints require the internal child_guid. National ID numbers do
+not satisfy the studentGuid parameter. Match children locally by a configured
+GUID or an unambiguous private_name. Keep names, identifiers and homework out
+of shared logs. Child objects hide personal fields in their generated repr.
+
+get_children() logs in when needed and otherwise uses cached children.
+A successful re-login replaces the cache. Missing children lists return an
+empty tuple. login() continues to return MashovSession.
